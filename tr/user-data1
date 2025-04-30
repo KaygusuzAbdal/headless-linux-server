@@ -1,0 +1,130 @@
+#cloud-config
+autoinstall:
+  version: 1
+  identity:
+    hostname: LU-SECBLU-TLAB-001
+    username: admin
+    password: "$6$t9x461mYF.1qQtdj$4G1zqSMSHXYSW7uIYKH.staI2q8SDOVhYjmnFGwtOX0TCFcxSdVWJg8ovqw5AuSGefxHoZv0Dtx0W9CT0dcvQ."
+  ssh:
+    install-server: true
+    allow-pw: true
+  storage:
+    layout:
+      name: direct
+    config:
+      - type: disk
+        id: disk0
+        match:
+          size: largest
+        wipe: superblock-recursive
+        ptable: gpt
+        preserve: false
+        grub_device: true
+
+      - type: partition
+        id: efi-partition
+        device: disk0
+        size: 512M
+        flag: boot
+        grub_device: true
+
+      - type: partition
+        id: root-partition
+        device: disk0
+        size: -1
+
+      - type: format
+        id: efi-format
+        volume: efi-partition
+        fstype: fat32
+
+      - type: format
+        id: root-format
+        volume: root-partition
+        fstype: ext4
+
+      - type: mount
+        id: mount-efi
+        device: efi-format
+        path: /boot/efi
+
+      - type: mount
+        id: mount-root
+        device: root-format
+        path: /
+  packages:
+    - net-tools
+    - htop
+    - ufw
+    - openssh-server
+  late-commands:
+    - curtin in-target -- bash -c 'echo "[+] Creating debug file (/root/autoinstall-debug.log)" > /root/autoinstall-debug.log'
+    - curtin in-target -- bash -c 'echo "[+] Installing Required Packages..." >> /root/autoinstall-debug.log'
+    - curtin in-target -- apt-get update
+    - curtin in-target -- apt-get install -y net-tools htop ufw openssh-server efibootmgr || true
+    - curtin in-target -- bash -c '
+        {
+          echo "[+] Starting Disk Wipe Process..." >> /root/autoinstall-debug.log
+          root_disk=$(lsblk -no PKNAME / | head -n1)
+          echo "[+] Root disk found as $root_disk" >> /root/autoinstall-debug.log
+
+          for disk in $(lsblk -dno NAME); do
+            rota_file="/sys/block/$disk/queue/rotational"
+            rota="1"
+            [ -f "$rota_file" ] && rota=$(cat "$rota_file")
+            
+            if [ "$rota" = "0" ] || [ "$rota" = "1" ]; then
+              if [[ "$disk" != "$root_disk" ]]; then
+                echo "[+] Wiping /dev/$disk (rotational=$rota)..." >> /root/autoinstall-debug.log
+
+                wipefs -a /dev/$disk | tee -a /root/autoinstall-debug.log >&2
+                wipe_status=$?
+                if [ $wipe_status -eq 0 ]; then
+                  echo "[+] wipefs completed successfully on /dev/$disk" >> /root/autoinstall-debug.log
+                else
+                  echo "[!] ERROR - wipefs failed on /dev/$disk with code $wipe_status" >> /root/autoinstall-debug.log
+                fi
+
+                sgdisk --zap-all /dev/$disk | tee -a /root/autoinstall-debug.log >&2
+                sgdisk_status=$?
+                if [ $sgdisk_status -eq 0 ]; then
+                  echo "[+] sgdisk completed successfully on /dev/$disk" >> /root/autoinstall-debug.log
+                else
+                  echo "[!] ERROR - sgdisk failed on /dev/$disk with code $sgdisk_status" >> /root/autoinstall-debug.log
+                fi
+
+                if [ $wipe_status -eq 0 ] && [ $sgdisk_status -eq 0 ]; then
+                  echo "[+] SUCCESS - /dev/$disk has been wiped successfully" >> /root/autoinstall-debug.log
+                fi
+              fi
+            fi
+          done
+        } || echo "[!] Disk wipe block failed" >> /root/autoinstall-debug.log ' || true
+    - curtin in-target -- bash -c '
+        echo "[+] Removing Windows Boot Manager entry..." >> /root/autoinstall-debug.log
+        WIN_ENTRY=$(efibootmgr | grep -i "Windows Boot Manager" | awk "{print \$1}" | sed "s/Boot//;s/\*//")
+        if [ ! -z "$WIN_ENTRY" ]; then
+          efibootmgr -b $WIN_ENTRY -B >> /root/autoinstall-debug.log 2>&1 && \
+          echo "[+] Windows Boot Manager entry deleted (Boot$WIN_ENTRY)" >> /root/autoinstall-debug.log || \
+          echo "[!] ERROR - Failed to delete Windows Boot Manager (Boot$WIN_ENTRY)" >> /root/autoinstall-debug.log
+        else
+          echo "[+] No Windows Boot Manager entry found." >> /root/autoinstall-debug.log
+        fi
+      ' || true
+    - curtin in-target -- bash -c '
+        echo "[+] Changing Boot Priority..." >> /root/autoinstall-debug.log
+        BOOTNUM=$(efibootmgr | grep "Ubuntu" | head -n1 | awk "{print \\\$1}" | sed "s/Boot//;s/\\*//") | while read entry; do efibootmgr -b "$entry" -B
+        if [ ! -z "$BOOTNUM" ]; then
+          efibootmgr -o $BOOTNUM && \
+          echo "[+] Boot priority set to Ubuntu (Boot$BOOTNUM)" >> /root/autoinstall-debug.log || \
+          echo "[!] WARNING - efibootmgr failed to change boot order!" | tee -a /root/autoinstall-debug.log >&2
+        else
+          echo "[!] ERROR - Could not find Ubuntu EFI boot entry!" >> /root/autoinstall-debug.log
+        fi
+      ' || true
+    - curtin in-target -- loadkeys trq
+    - curtin in-target -- bash -c "echo 'KEYMAP=trq' >> /etc/vconsole.conf"
+    - curtin in-target -- ufw allow 22
+    - curtin in-target -- ufw --force enable
+    - curtin in-target -- bash -c "echo LU-SECBLU-TLAB-$(date +%d-%m-%YT%H-%M) > /etc/hostname"
+    - curtin in-target -- bash -c "echo -e '\n===============================\nSystem Initialized.\nWelcome to Blue Team Lab\n===============================\nPowered by Mustafa Cuneyt Kafes\n' > /etc/motd"
