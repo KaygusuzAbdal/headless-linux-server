@@ -1,0 +1,183 @@
+#cloud-config
+autoinstall:
+  version: 1
+  identity:
+    # device name
+    hostname: LU-SECBLU-TLAB-001
+    # root username
+    username: admin
+    # you can replace the password below using "openssl passwd -6" (uses SHA-512)
+    # password: 123admin
+    password: "$6$t9x461mYF.1qQtdj$4G1zqSMSHXYSW7uIYKH.staI2q8SDOVhYjmnFGwtOX0TCFcxSdVWJg8ovqw5AuSGefxHoZv0Dtx0W9CT0dcvQ."
+  ssh:
+    # auto-install the SSH server
+    install-server: true
+    # allow password-based login
+    allow-pw: true
+  # this block defines the disk layout to be applied on the server
+  storage:
+    layout:
+      name: direct
+    config:
+      - type: disk
+        id: disk0 # diskID will be disk0
+        match:
+          size: largest # automatically selects the largest disk on the system (main disk)
+        wipe: superblock-recursive # wipes all structures on the disk
+        ptable: gpt # set disk table type to GPT (GUID Partition Table)
+        preserve: false # do not keep old data, wipe completely (recovery)
+        grub_device: true # install grub on this disk
+
+        # reserve 512MB on disk0 for /boot/efi (efi-partition on disk0)
+      - type: partition
+        id: efi-partition
+        device: disk0
+        size: 512M
+        flag: boot # assign boot flag (this is important)
+        grub_device: true
+
+        # remaining space (-1) will be the second partition (root-partition on disk0)
+      - type: partition
+        id: root-partition
+        device: disk0
+        size: -1
+
+        # format /boot/efi partition with FAT32 (efi partition)
+      - type: format
+        id: efi-format
+        volume: efi-partition
+        fstype: fat32
+
+        # format root disk (/) with EXT4 (most common Linux filesystem) (root partition)
+      - type: format
+        id: root-format
+        volume: root-partition
+        fstype: ext4
+
+        # mount FAT32 partition to /boot/efi
+      - type: mount
+        id: mount-efi
+        device: efi-format
+        path: /boot/efi
+
+        # mount root (/) to EXT4 partition (format1 i.e. the empty space on disk)
+      - type: mount
+        id: mount-root
+        device: root-format
+        path: /
+  packages:
+    - net-tools
+    - htop
+    - ufw
+    - openssh-server
+  late-commands:
+    # create a file to write debug logs (/root/autoinstall-debug.log)
+    - curtin in-target -- bash -c 'echo "[+] Creating debug file (/root/autoinstall-debug.log)" > /root/autoinstall-debug.log'
+
+    # install required packages with apt-get update
+    - curtin in-target -- bash -c 'echo "[+] Installing Required Packages..." >> /root/autoinstall-debug.log'
+    - curtin in-target -- apt-get update
+    # htop: tool to monitor system resources in real-time (RAM, CPU, etc.)
+    # net-tools: download tools like ifconfig, netstat, etc.
+    # UFW (Uncomplicated Firewall): blocks all ports except allowed ones
+    # openssh-server: provides SSH service
+    - curtin in-target -- apt-get install -y net-tools htop ufw openssh-server efibootmgr || true
+
+    # Disk Wipe Script
+    - curtin in-target -- bash -c '
+        {
+          # write start message to the log file
+          echo "[+] Starting Disk Wipe Process..." >> /root/autoinstall-debug.log
+          # determine root disk using lsblk (this is the disk we are currently running commands from)
+          root_disk=$(lsblk -no PKNAME / | head -n1)
+          echo "[+] Root disk found as $root_disk" >> /root/autoinstall-debug.log
+          # for all connected disks;
+          for disk in $(lsblk -dno NAME); do
+            # check if it's SSD or HDD; if rotational=1 then it's HDD, 0 means SSD
+            rota_file="/sys/block/$disk/queue/rotational"
+            rota="1"
+            [ -f "$rota_file" ] && rota=$(cat "$rota_file")
+            
+            # wipe only SSD and HDD disks
+            if [ "$rota" = "0" ] || [ "$rota" = "1" ]; then
+              # skip if it's the root disk (to avoid deleting the current system)
+              if [[ "$disk" != "$root_disk" ]]; then
+                
+                echo "[+] Wiping /dev/$disk (rotational=$rota)..." >> /root/autoinstall-debug.log
+
+                # run wipefs and write output to log (log errors too)
+                wipefs -a /dev/$disk | tee -a /root/autoinstall-debug.log >&2
+                wipe_status=$?
+
+                # log success or failure
+                if [ $wipe_status -eq 0 ]; then
+                  echo "[+] wipefs completed successfully on /dev/$disk" >> /root/autoinstall-debug.log
+                else
+                  echo "[!] ERROR - wipefs failed on /dev/$disk with code $wipe_status" >> /root/autoinstall-debug.log
+                fi
+
+                # run sgdisk and write output to log
+                sgdisk --zap-all /dev/$disk | tee -a /root/autoinstall-debug.log >&2
+                sgdisk_status=$?
+
+                # log success or failure
+                if [ $sgdisk_status -eq 0 ]; then
+                  echo "[+] sgdisk completed successfully on /dev/$disk" >> /root/autoinstall-debug.log
+                else
+                  echo "[!] ERROR - sgdisk failed on /dev/$disk with code $sgdisk_status" >> /root/autoinstall-debug.log
+                fi
+
+                # if both succeeded, write success message
+                if [ $wipe_status -eq 0 ] && [ $sgdisk_status -eq 0 ]; then
+                  echo "[+] SUCCESS - /dev/$disk has been wiped successfully" >> /root/autoinstall-debug.log
+                fi
+              fi
+            fi
+          done
+          # if any errors occur, write to log but continue installation = || true 
+        } || echo "[!] Disk wipe block failed" >> /root/autoinstall-debug.log ' || true
+
+      # Script to remove Windows Boot Manager
+    - curtin in-target -- bash -c '
+        echo "[+] Removing Windows Boot Manager entry..." >> /root/autoinstall-debug.log
+
+        # check if "Windows Boot Manager" exists
+        WIN_ENTRY=$(efibootmgr | grep -i "Windows Boot Manager" | awk "{print \$1}" | sed "s/Boot//;s/\*//")
+        # if it exists
+        if [ ! -z "$WIN_ENTRY" ]; then
+          # try to delete using efibootmgr; log success or failure
+          efibootmgr -b $WIN_ENTRY -B >> /root/autoinstall-debug.log 2>&1 && \
+          echo "[+] Windows Boot Manager entry deleted (Boot$WIN_ENTRY)" >> /root/autoinstall-debug.log || \
+          echo "[!] ERROR - Failed to delete Windows Boot Manager (Boot$WIN_ENTRY)" >> /root/autoinstall-debug.log
+        else
+          # write message if not found
+          echo "[+] No Windows Boot Manager entry found." >> /root/autoinstall-debug.log
+        fi
+        # continue even if there’s an error = || true
+      ' || true
+
+      # Boot Priority Change Script
+    - curtin in-target -- bash -c '
+        echo "[+] Changing Boot Priority..." >> /root/autoinstall-debug.log
+
+        # get Ubuntu boot entry number using efibootmgr
+        BOOTNUM=$(efibootmgr | grep "Ubuntu" | head -n1 | awk "{print \\\$1}" | sed "s/Boot//;s/\\*//") | while read entry; do efibootmgr -b "$entry" -B
+        if [ ! -z "$BOOTNUM" ]; then
+          # set as first boot option; log success or error
+          efibootmgr -o $BOOTNUM && \
+          echo "[+] Boot priority set to Ubuntu (Boot$BOOTNUM)" >> /root/autoinstall-debug.log || \
+          echo "[!] WARNING - efibootmgr failed to change boot order!" | tee -a /root/autoinstall-debug.log >&2
+        else
+          # log error if Ubuntu boot entry not found
+          echo "[!] ERROR - Could not find Ubuntu EFI boot entry!" >> /root/autoinstall-debug.log
+        fi
+        # continue even if there’s an error = || true
+        # some devices may fail to change boot priority due to permission issues
+      ' || true
+      # allow port 22 in UFW (default firewall on Ubuntu)
+    - curtin in-target -- ufw allow 22
+    - curtin in-target -- ufw --force enable
+      # update hostname (e.g. LU-SECBLU-TLAB-28-04-2025T05-40)
+    - curtin in-target -- bash -c "echo LU-SECBLU-TLAB-$(date +%d-%m-%YT%H-%M) > /etc/hostname"
+      # system welcome message
+    - curtin in-target -- bash -c "echo -e '\n===============================\nSystem Initialized.\nWelcome to Blue Team Lab\n===============================\nPowered by Mustafa Cuneyt Kafes\n' > /etc/motd"
