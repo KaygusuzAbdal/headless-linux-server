@@ -122,8 +122,6 @@ autoinstall:
           echo "[!] ERROR - Could not find Ubuntu EFI boot entry!" >> /root/autoinstall-debug.log
         fi
       ' || true
-    - curtin in-target -- loadkeys trq
-    - curtin in-target -- bash -c "echo 'KEYMAP=trq' >> /etc/vconsole.conf"
     - curtin in-target -- ufw allow 22
     - curtin in-target -- ufw --force enable
     - curtin in-target -- bash -c "echo LU-SECBLU-TLAB-$(date +%d-%m-%YT%H-%M) > /etc/hostname"
