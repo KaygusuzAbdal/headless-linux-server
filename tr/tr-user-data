@@ -1,0 +1,187 @@
+#cloud-config
+autoinstall:
+  version: 1
+  identity:
+    # cihaz adı
+    hostname: LU-SECBLU-TLAB-001
+    # root kullanıcı adı
+    username: admin
+    # burdaki şifreyi "openssl passwd -6" ile değiştirebilirsin (SHA-512 kullanır)
+    # şifre: 123admin
+    password: "$6$t9x461mYF.1qQtdj$4G1zqSMSHXYSW7uIYKH.staI2q8SDOVhYjmnFGwtOX0TCFcxSdVWJg8ovqw5AuSGefxHoZv0Dtx0W9CT0dcvQ."
+  ssh:
+    # ssh sunucusunu otomatik kur
+    install-server: true
+    # parola ile girişe izin ver
+    allow-pw: true
+  # bu blok sunucuya hangi disk yapısının uygulanacağını tarif eder
+  storage:
+    layout:
+      name: direct
+    config:
+      - type: disk
+        id: disk0 # diskID = disk0 olacak
+        match:
+          size: largest # cihazdaki en büyük diski otomatik bul (yani ana disk)
+        wipe: superblock-recursive # diskteki tüm yapıları sil
+        ptable: gpt # disk yapısını GPT (GUID Partition Table) yap
+        preserve: false # eski verileri saklama, tamamen sil (recovery)
+        grub_device: true # grub'u bu diske kur
+
+        # /boot/efi için diskte 512MB'lık kısım ayırıyoruz (disk0'da efi-partition)
+      - type: partition
+        id: efi-partition
+        device: disk0
+        size: 512M
+        flag: boot # boot flag'i atıyoruz (bu önemli)
+        grub_device: true
+
+        # geri kalan (-1) da ikinci partition olcak yani diskin boş kısmı (disk0'da root-partition)
+      - type: partition
+        id: root-partition
+        device: disk0
+        size: -1
+
+        # /boot/efi partition'ı FAT32 formatında biçimlendiriliyor (efi partition)
+      - type: format
+        id: efi-format
+        volume: efi-partition
+        fstype: fat32
+
+        # ana disk (/) EXT4 olarak formatlanıyor (en yaygın linux dosya sistemi olduğu için) (root partition)
+      - type: format
+        id: root-format
+        volume: root-partition
+        fstype: ext4
+
+        # /boot/efi klasörüne FAT32 partition mount ediyoruz
+      - type: mount
+        id: mount-efi
+        device: efi-format
+        path: /boot/efi
+
+        # root dizin (/) EXT4 disk bölümüne bağlanıyor (format1 yani boş diskteki alan)
+      - type: mount
+        id: mount-root
+        device: root-format
+        path: /
+  packages:
+    - net-tools
+    - htop
+    - ufw
+    - openssh-server
+  late-commands:
+    # debug loglarını yazacağımız bir dosya oluşturuyoruz (/root/autoinstall-debug.log)
+    - curtin in-target -- bash -c 'echo "[+] Creating debug file (/root/autoinstall-debug.log)" > /root/autoinstall-debug.log'
+
+    # apt-get update yaparak gerekli paketleri yüklediğimiz kısım
+    - curtin in-target -- bash -c 'echo "[+] Installing Required Packages..." >> /root/autoinstall-debug.log'
+    - curtin in-target -- apt-get update
+    # htop: sistem kaynaklarını canlı olarak gösteren bir araç (RAM, CPU vb.)
+    # net-tools: ifconfig, netstat vb. komutları kullanabilmek için net-tools araçlarını indiriyoruz
+    # UFW (Uncomplicated Firewall): izin verilen portlar hariç tüm portları kapatır
+    # openssh-server: SSH servisini sağlayan paket
+    - curtin in-target -- apt-get install -y net-tools htop ufw openssh-server efibootmgr || true
+
+    # Diskleri Temizleme (Formatlama) Scripti
+    - curtin in-target -- bash -c '
+        {
+          # Log dosyasına başlangıç mesajı yazılıyor
+          echo "[+] Starting Disk Wipe Process..." >> /root/autoinstall-debug.log
+          # lsblk ile root diski belirliyoruz (şu an komutları çalıştırdığımız disk root diski )
+          root_disk=$(lsblk -no PKNAME / | head -n1)
+          echo "[+] Root disk found as $root_disk" >> /root/autoinstall-debug.log
+          # sistemde bağlı olan tüm diskler için;
+          for disk in $(lsblk -dno NAME); do
+            # SSD mi HDD mi kontrolü yapıyoruz, Rotation 1 ise HDD, 0 ise SDD'dir (HDD disklerin içinde dönen plaklar bulunur)
+            rota_file="/sys/block/$disk/queue/rotational"
+            rota="1"
+            [ -f "$rota_file" ] && rota=$(cat "$rota_file")
+            
+            # Sadece HDD ve SSD diskler için wipe işlemi yapılacak
+            if [ "$rota" = "0" ] || [ "$rota" = "1" ]; then
+              # eğer bulunan disk root diski değilse (aksi takdirde kendi sistemimizi silmeye çalışırız, sistem hata vermesin)
+              if [[ "$disk" != "$root_disk" ]]; then
+                
+                echo "[+] Wiping /dev/$disk (rotational=$rota)..." >> /root/autoinstall-debug.log
+
+                # wipefs ile silme işlemi yapıyoruz (hata alırsak çıktıyı loglara yazıyoruz)
+                wipefs -a /dev/$disk | tee -a /root/autoinstall-debug.log >&2
+                wipe_status=$?
+
+                # eğer başarılıysa (exit code 0 ise) olumlu mesaj yazdır, değilse loglara hata mesajı yazdır
+                if [ $wipe_status -eq 0 ]; then
+                  echo "[+] wipefs completed successfully on /dev/$disk" >> /root/autoinstall-debug.log
+                else
+                  echo "[!] ERROR - wipefs failed on /dev/$disk with code $wipe_status" >> /root/autoinstall-debug.log
+                fi
+
+                # sgdisk ile silme işlemi yapıyoruz (hata alırsak çıktıyı loglara yazıyoruz)
+                sgdisk --zap-all /dev/$disk | tee -a /root/autoinstall-debug.log >&2
+                sgdisk_status=$?
+
+                # eğer başarılıysa (exit code 0 ise) olumlu mesaj yazdır, değilse loglara hata mesajı yazdır
+                if [ $sgdisk_status -eq 0 ]; then
+                  echo "[+] sgdisk completed successfully on /dev/$disk" >> /root/autoinstall-debug.log
+                else
+                  echo "[!] ERROR - sgdisk failed on /dev/$disk with code $sgdisk_status" >> /root/autoinstall-debug.log
+                fi
+
+                # ikisinde de exit code 0 döndüyse başarılı mesajı yazdır
+                if [ $wipe_status -eq 0 ] && [ $sgdisk_status -eq 0 ]; then
+                  echo "[+] SUCCESS - /dev/$disk has been wiped successfully" >> /root/autoinstall-debug.log
+                fi
+              fi
+            fi
+          done
+          # işlemlerde hata alındıdysa loglara hata mesajı yazdır ama kurulumu bozmadan devam ettir = || true 
+        } || echo "[!] Disk wipe block failed" >> /root/autoinstall-debug.log ' || true
+
+      # Windows Boot Manager'ı silme scripti
+    - curtin in-target -- bash -c '
+        echo "[+] Removing Windows Boot Manager entry..." >> /root/autoinstall-debug.log
+
+        # "Windows Boot Manager" var mı kontrol et
+        WIN_ENTRY=$(efibootmgr | grep -i "Windows Boot Manager" | awk "{print \$1}" | sed "s/Boot//;s/\*//")
+        # eğer varsa
+        if [ ! -z "$WIN_ENTRY" ]; then
+          # efibootmgr kullanarak silme işlemi yap, true dönerse başarılı mesaj yazdır, false dönerse hata çıktısını loglara yaz
+          efibootmgr -b $WIN_ENTRY -B >> /root/autoinstall-debug.log 2>&1 && \
+          echo "[+] Windows Boot Manager entry deleted (Boot$WIN_ENTRY)" >> /root/autoinstall-debug.log || \
+          echo "[!] ERROR - Failed to delete Windows Boot Manager (Boot$WIN_ENTRY)" >> /root/autoinstall-debug.log
+        else
+          # Windows Boot Manager bulunamadı mesajı yazdır
+          echo "[+] No Windows Boot Manager entry found." >> /root/autoinstall-debug.log
+        fi
+        # işlemlerde hata alınsa bile kurulumu bozmadan devam ettir = || true
+      ' || true
+
+      # Boot Priority Değiştirme Scripti
+    - curtin in-target -- bash -c '
+        echo "[+] Changing Boot Priority..." >> /root/autoinstall-debug.log
+
+        # efibootmgr ile Ubuntu'nun Boot Priority numarasını al
+        BOOTNUM=$(efibootmgr | grep "Ubuntu" | head -n1 | awk "{print \\\$1}" | sed "s/Boot//;s/\\*//") | while read entry; do efibootmgr -b "$entry" -B
+        if [ ! -z "$BOOTNUM" ]; then
+          # En öncelikli olarak belirle, true dönerse başarılı mesaj yazdır, false dönerse hata çıktısını loglara yaz
+          efibootmgr -o $BOOTNUM && \
+          echo "[+] Boot priority set to Ubuntu (Boot$BOOTNUM)" >> /root/autoinstall-debug.log || \
+          echo "[!] WARNING - efibootmgr failed to change boot order!" | tee -a /root/autoinstall-debug.log >&2
+        else
+          # Ubuntu distro ile ilgili boot bulunamazsa hata mesajı yazdır
+          echo "[!] ERROR - Could not find Ubuntu EFI boot entry!" >> /root/autoinstall-debug.log
+        fi
+        # işlemlerde hata alınsa bile kurulumu bozmadan devam ettir = || true
+        # çünkü efibootmgr yetki sorunundan dolayı boot priority sıralamasını bazı cihazlarda ayarlayamayabilir
+      ' || true
+      # klavye için türkçe dilini yükle
+    - curtin in-target -- loadkeys trq
+      # vconsole.conf dosyasına KEYMAP=trq değerini ekle (eğer işe yaramazsa bu dosyanın içerisinde manuel düzenleme yapın)
+    - curtin in-target -- bash -c "echo 'KEYMAP=trq' >> /etc/vconsole.conf"
+      # UFW'de (ubuntu'nun default firewall'ında) port 22'yi aktifleştir
+    - curtin in-target -- ufw allow 22
+    - curtin in-target -- ufw --force enable
+      # hostname ismi güncelleme (örn format: LU-SECBLU-TLAB-28-04-2025T05-40)
+    - curtin in-target -- bash -c "echo LU-SECBLU-TLAB-$(date +%d-%m-%YT%H-%M) > /etc/hostname"
+      # sistem karşılama mesajı
+    - curtin in-target -- bash -c "echo -e '\n===============================\nSystem Initialized.\nWelcome to Blue Team Lab\n===============================\nPowered by Mustafa Cuneyt Kafes\n' > /etc/motd"
