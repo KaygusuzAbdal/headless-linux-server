@@ -1,0 +1,5 @@
+instance-id: LU-SECBLU-TLAB-001
+local-hostname: LU-SECBLU-TLAB-001
+region: tr
+availability-zone: internal
+vendor-data: Mustafa Cuneyt Kafes
