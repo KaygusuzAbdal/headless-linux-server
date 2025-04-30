@@ -65,11 +65,13 @@ autoinstall:
         id: mount-root
         device: root-format
         path: /
+  # sistem kurulumu tamamlandıktan sonra otomatik olarak yüklenecek paketleri listelediğimiz kısım
   packages:
     - net-tools
     - htop
     - ufw
     - openssh-server
+  # sistem kurulumu tamamlandıktan hemen sonra çalıştırılacak komutları burada yazıyoruz
   late-commands:
     # debug loglarını yazacağımız bir dosya oluşturuyoruz (/root/autoinstall-debug.log)
     - curtin in-target -- bash -c 'echo "[+] Creating debug file (/root/autoinstall-debug.log)" > /root/autoinstall-debug.log'
