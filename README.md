@@ -5,7 +5,7 @@ It contains auto-installation (cloud-init) files I created to convert an old PC 
 
 Full articles:  
 👉 [TR - Evde BlueTeam Lab Kurulumu - Bölüm 3](https://cuneytkafes.medium.com/evde-blueteam-lab-kurulumu-bölüm-3-evdeki-pc-nasıl-sunucuya-dönüştürülür-9a7e7333b563)  
-👉 [EN - From Dusty PC to Blue Team Lab - Part 3](#) *(link coming soon)*
+👉 [EN - From Dusty PC to Blue Team Lab - Part 3](https://medium.com/@cuneytkafes/from-dusty-pc-to-blue-team-lab-part-3-how-to-turn-your-old-pc-into-a-headless-server-base-iso-a108251d6489)
 
 ---
 
